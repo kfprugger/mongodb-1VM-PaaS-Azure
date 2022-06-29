@@ -1,43 +1,69 @@
-# Connect to Azure w/ Azure User Managed Identity Acct ID
-$azUserAssignedId = "a3ff0c85-6f0c-4274-bc3b-3757667fa2dc"
-$AzureContext = (Connect-AzAccount -Identity -AccountId $azUserAssignedId).context
+# Azure Key Vault Name Containing Super User Password
+param (
+[Parameter(Mandatory)]
+[string]
+$akvName,
 
-# Azure Key Vault Variables containing super user credential
-$akvName = "akv-pai-mgt"
-$secretName = "mongodb-superadmin"
-$superUserName = "joeyadmin"
-## get the password
-$sUserPwd = (Get-AzKeyVaultSecret -VaultName $akvName -Name $secretName -AsPlainText)
+# Desired Super User Login Name
+[Parameter(Mandatory)]
+[string]
+$superUserName,
+
+
+# User Assigned Managed Identity ID (client ID) -- MUST BE ASSIGNED TO THE VM & Have Key Vault Secret Reader RBAC on the $secretname
+[Parameter(Mandatory)]
+[string]
+$userAssignedClientId
+)
+# Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force -ErrorAction SilentlyContinue
+
+if (!(Get-PackageProvider -Name NuGet)) {
+
+    Install-PackageProvider -Name NuGet -RequiredVersion 2.8.5.201 -Force
+}
+
+if (!(Get-Module Az.KeyVault)){
+
+    Install-Module Az.Resources -Force -Confirm:$false
+    Install-Module Az.KeyVault -Force -Confirm:$false
+    Import-Module Az.Resources
+    Import-Module Az.KeyVault
+} else {
+    Import-Module Az.Resources
+    Import-Module Az.KeyVault 
+}
+
+
 
 # Mongo Download Links (change for future Releases)
 $shellUrl = "https://downloads.mongodb.com/compass/mongosh-1.3.1-x64.msi"
 $dbUrl = "https://fastdl.mongodb.org/windows/mongodb-windows-x86_64-5.0.8-signed.msi"
 $mongoBinDir = "M:\MongoDB\Server\5.0\bin" # you might need to change if releases change bin directory structures
 
-## Super user admin name
-$adminUserName="paiadmin" 
-
+# ## Super user admin name
+# $localAdminGroupWmi = Get-WMIObject Win32_Group -Filter "Name='Administrators'" 
+# $adminUserName = ($localAdminGroupWmi.GetRelated("Win32_UserAccount")).Name
 
 
 
 
 function Set-ServiceRecovery{
-    [alias(‘Set-Recovery’)]
+    [alias('Set-Recovery')]
     param
     (
     [string] [Parameter(Mandatory=$true)] $ServiceName,
     [string] [Parameter(Mandatory=$true)] $Server,
-    [string] $action1 = “restart”,
+    [string] $action1 = "restart",
     [int] $time1 = 30000, # in miliseconds
-    [string] $action2 = “restart”,
+    [string] $action2 = "restart",
     [int] $time2 = 30000, # in miliseconds
-    [string] $actionLast = “restart”,
+    [string] $actionLast = "restart",
     [int] $timeLast = 30000, # in miliseconds
     [int] $resetCounter = 4000 # in seconds
     )
-     $serverPath = “\\” + $server
-     $services = Get-CimInstance -ClassName ‘Win32_Service’ -ComputerName $Server| Where-Object {$_.Name -contains $ServiceName}
-     $action = $action1+“/”+$time1+“/”+$action2+“/”+$time2+“/”+$actionLast+“/”+$timeLast
+     $serverPath = "\\" + $server
+     $services = Get-CimInstance -ClassName "Win32_Service" -ComputerName $Server| Where-Object {$_.Name -contains $ServiceName}
+     $action = $action1+"/"+$time1+"/"+$action2+"/"+$time2+"/"+$actionLast+"/"+$timeLast
     foreach ($service in $services){
         # https://technet.microsoft.com/en-us/library/cc742019.aspx
         sc.exe $serverPath failure $($service.Name) actions= $action reset= $resetCounter
@@ -51,9 +77,9 @@ function Set-ServiceRecovery{
 if (!(get-psdrive -Name "M" -ErrorAction SilentlyContinue)){
     if (Get-Disk | Where PartitionStyle -eq 'raw'){
     $partMDrive = Get-Disk | Where PartitionStyle -eq 'raw' |
-    Initialize-Disk -PartitionStyle GPT -PassThru |
-    New-Partition  -UseMaximumSize -DriveLetter M -ErrorVariable $partError |
-    Format-Volume -FileSystem NTFS -NewFileSystemLabel "DataDisk"  -Confirm:$false -ErrorVariable $partError 
+    Initialize-Disk -PartitionStyle GPT -PassThru -ErrorAction Stop |
+    New-Partition  -UseMaximumSize -DriveLetter M -ErrorVariable $partError -ErrorAction Stop |
+    Format-Volume -FileSystem NTFS -NewFileSystemLabel "DataDisk"  -Confirm:$false -ErrorVariable $partError  -ErrorAction Stop
 
     Write-Host "Initialization of M:\ Filesystem on the data disk is: " $partError $partMDrive.OperationalStatus} else {
         write-host "No data disk present. Breaking out of script"
@@ -68,22 +94,8 @@ if (!(get-psdrive -Name "M" -ErrorAction SilentlyContinue)){
 
 Start-Sleep 5
 
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
 
 
-if (!(Get-Module Az.KeyVault)){
-    if (!(Get-PackageProvider -Name NuGet)) {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Install-PackageProvider -Name NuGet -Force 
-    }
-    Install-Module Az.Resources -Force -Confirm:$false
-    Install-Module Az.KeyVault -Force -Confirm:$false
-    Import-Module Az.Resources
-    Import-Module Az.KeyVault
-} else {
-    Import-Module Az.Resources
-    Import-Module Az.KeyVault 
-}
 
 # Install MongoDB Server
 
@@ -91,13 +103,13 @@ $dlLocation = "M:\Downloads"
 $msiDb = ($dburl -split "/")[4]
 if (!(test-path $dlLocation)) {mkdir $dlLocation}
 
-$outFileLocation = "$dlLocation\$msiDb"
-if (!(test-path $outfilelocation)){Invoke-WebRequest -Uri $dbUrl -OutFile $outFileLocation} else {
-    echo "$outFileLocation  is present"
+$dbOutFileLocation = "$dlLocation\$msiDb"
+if (!(test-path $dbOutfilelocation)){Invoke-RestMethod $dbUrl -OutFile $dbOutFileLocation -ErrorAction Stop  } else {
+    echo "$dbOutFileLocation  is present"
 }
 if (!(Get-Service MongoDB -ErrorAction SilentlyContinue )){
     Get-Date
-    Start-Process -WorkingDirectory $dlLocation -FilePath msiexec -ArgumentList "/l*v mdbinstall.log  /qb /i $msidb INSTALLLOCATION=""M:\MongoDB\Server\5.0\"" ADDLOCAL=""ALL"" " -Wait:$true
+    Start-Process -WorkingDirectory $dlLocation -FilePath msiexec -ArgumentList "/l*v mdbinstall.log  /qb /i $msidb INSTALLLOCATION=""M:\MongoDB\Server\5.0\"" ADDLOCAL=""ALL"" " -Wait:$true -ErrorAction Stop
     write-host " now done with server install"
     Get-Date
 } else {
@@ -112,14 +124,15 @@ if (!(Get-Service MongoDB -ErrorAction SilentlyContinue )){
 $msiShellPath = ($shellUrl -split "/")[4]
 $outFileLocation = "$dlLocation\$msiShellPath"
 
-if (!(test-path $outfilelocation)){Invoke-WebRequest -Uri $shellUrl -OutFile $outFileLocation} else {
+if (!(test-path $outfilelocation)){Invoke-RestMethod $shellUrl -OutFile $outFileLocation -ErrorAction Stop } else {
     echo "$outFileLocation  is present"
 }
 
 if (!(test-path monogosh -ErrorAction SilentlyContinue )){
-    start-process msiexec.exe `
-    -argumentlist "/l*v mshinstall.log  /qn /i $msiShellPath" `
-    -WorkingDirectory $dlLocation -Wait
+    Get-Date
+    Start-Process -WorkingDirectory $dlLocation -FilePath msiexec -ArgumentList "/l*v mshinstall.log  /qn /i $msiShellPath"  -Wait:$true
+    write-host " now done with shell install"
+    Get-Date
 } else {
     write-host "mongo shell is already installed"
 }
@@ -130,18 +143,40 @@ if (!(test-path monogosh -ErrorAction SilentlyContinue )){
 
 # Set aliases for current shell
 
-Set-Alias mongosh "C:\Users\$adminUserName\AppData\Local\Programs\mongosh\mongosh.exe"
+
+
+$secretName = $superUserName
+
+# Connect to Azure w/ Azure User Managed Identity Acct ID
+$AzureContext = (Connect-AzAccount -Identity -AccountId $userAssignedClientId -ErrorAction Stop).context 
+
+## get the password
+$sUserPwd = (Get-AzKeyVaultSecret -VaultName $akvName -Name $secretName -AsPlainText -ErrorAction Stop)
+
+
+Set-Alias mongosh "C:\Windows\System32\config\systemprofile\AppData\Local\Programs\mongosh\mongosh.exe"
+write-host "alias for mongosh --> "
+(get-alias mongosh).name
+
 Set-Alias mongo "$mongoBinDir\mongo.exe"
 
 
 
 # Allow Secure User External Access with Superuser name and pwd
 ## Set Windows FW to allow; Control access using Azure's NSGs
-New-NetFirewallRule -DisplayName "Mongodb-inbound" -Direction Inbound -LocalPort 27017 -Protocol TCP -Action Allow
+if (!(get-netfirewallrule -DisplayName "Mongodb-inbound") ){
+    Write-Host "Allowing Mongo through the firewall"
+    New-NetFirewallRule -DisplayName "Mongodb-inbound" -Direction Inbound -LocalPort 27017 -Protocol TCP -Action Allow}
+     else {
+    write-host "Firewall rule already in place for TCP 27017"
+    }
 
 # Begin update for SuperUser
 ## FIRST: Get the super user script with placeholders
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/kfprugger/mongodb-1VM-PaaS-Azure/main/addSuperUserLogin.js -OutFile "$dlLocation\addSuperUserLogin.js"
+if (!(test-path "$dlLocation\addSuperUserLogin.js" )) {
+
+Invoke-RestMethod  https://raw.githubusercontent.com/kfprugger/mongodb-1VM-PaaS-Azure/main/addSuperUserLogin.js -OutFile "$dlLocation\addSuperUserLogin.js"}
+
 
 ## SECOND: Replace the placeholders with your variables
 (Get-Content "$dlLocation\addSuperUserLogin.js").replace('[PWD_REPLACE_ME]', $sUserPwd) | Set-Content "$dlLocation\addSuperUserLogin.js"
@@ -149,7 +184,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/kfprugger/mongodb-1VM-P
 (Get-Content "$dlLocation\addSuperUserLogin.js").replace('[ADMIN_REPLACE_ME]', $superUserName) | Set-Content "$dlLocation\addSuperUserLogin.js"
 
 ## LAST: Execute the file to add your superuser into the admin DB
-mongosh -f "$dlLocation\addSuperUserLogin.js"
+Invoke-Command -ScriptBlock {mongosh -f "$dlLocation\addSuperUserLogin.js"} -ErrorAction Stop
 
 
 # Set your server config file to allow connections
@@ -158,4 +193,4 @@ mongosh -f "$dlLocation\addSuperUserLogin.js"
 
 # Restart Mongo and set to recover itself in case of stoppage
 restart-service MongoDB
-Set-ServiceRecovery -ServiceName "MongoDB” -Server $env:computername
+Set-ServiceRecovery -ServiceName "MongoDB" -Server $env:computername
